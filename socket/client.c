@@ -31,17 +31,22 @@ int main(int argc, char *argv[])
 	struct addrinfo hints, *servinfo, *p;
 	int rv;
 	char s[INET6_ADDRSTRLEN];
+	char *host;
 
-	if (argc != 2) {
-        fprintf(stderr,"usage: client hostname\n");
+	if (argc == 2) {
+        host = argv[1];
+    } else if (argc == 1) {
+        host = "127.0.0.1"; // default: loopback
+    } else {
+        fprintf(stderr, "usage: client [hostname]\n");
         exit(1);
-	}
+    }
 
 	memset(&hints, 0, sizeof hints);
 	hints.ai_family = AF_UNSPEC;
 	hints.ai_socktype = SOCK_STREAM;
 
-	if ((rv = getaddrinfo(argv[1], PORT, &hints, &servinfo)) != 0) {
+	if ((rv = getaddrinfo(host, PORT, &hints, &servinfo)) != 0) {
 		fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rv));
 		return 1;
 	}
