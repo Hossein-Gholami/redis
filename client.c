@@ -114,7 +114,15 @@ static void buf_append(Buffer *buf, const uint8_t *data, size_t len) {
 // QUERY -------------------------------------------------------------------------------
 
 // the `query` function was simply splited into `send_req` and `read_res`.
-static int32_t send_req(int fd, const uint8_t *text, size_t len) {
+
+// +------+-----+------+-----+------+-----+-----+------+
+// | nstr | len | str1 | len | str2 | ... | len | strn |
+// +------+-----+------+-----+------+-----+-----+------+
+static int32_t send_req(int fd, char **cmd, size_t cmd_count) {
+    uint32_t len = 4;  // the nstr field
+    for (size_t i = 0; i < cmd_count; i++) {
+        len += 4 + (uint32_t)strlen(cmd[i]);
+    }
     if (len > k_max_msg) {
         return -1;
     }
@@ -122,12 +130,21 @@ static int32_t send_req(int fd, const uint8_t *text, size_t len) {
     Buffer wbuf;
     buf_init(&wbuf);
     buf_append(&wbuf, (const uint8_t *)&len, 4);
-    buf_append(&wbuf, text, len);
+    uint32_t n = (uint32_t)cmd_count;
+    buf_append(&wbuf, (const uint8_t *)&n, 4);
+    for (size_t i = 0; i < cmd_count; i++) {
+        uint32_t p = (uint32_t)strlen(cmd[i]);
+        buf_append(&wbuf, (const uint8_t *)&p, 4);
+        buf_append(&wbuf, (const uint8_t *)cmd[i], p);
+    }
     int32_t rv = write_all(fd, wbuf.data, wbuf.len);
     buf_free(&wbuf);
     return rv;
 }
 
+// +--------+---------+
+// | status | data... |
+// +--------+---------+
 static int32_t read_res(int fd) {
     // 4 bytes header
     Buffer rbuf;
@@ -146,14 +163,19 @@ static int32_t read_res(int fd) {
     }
 
     uint32_t len = 0;
-    memcpy(&len, rbuf.data, 4);  // assume little endian
+    memcpy(&len, rbuf.data, 4);
+    if (len < 4) {
+        msg("bad response");
+        buf_free(&rbuf);
+        return -1;
+    }
     if (len > k_max_msg) {
         msg("too long");
         buf_free(&rbuf);
         return -1;
     }
 
-    // reply body
+    // reply body: 4-byte status + data
     buf_resize(&rbuf, 4 + len);
     err = read_full(fd, &rbuf.data[4], len);
     if (err) {
@@ -162,8 +184,9 @@ static int32_t read_res(int fd) {
         return err;
     }
 
-    // do something
-    printf("len:%u data:%.*s\n", len, len < 100 ? len : 100, &rbuf.data[4]);
+    uint32_t rescode = 0;
+    memcpy(&rescode, &rbuf.data[4], 4);
+    printf("server says: [%u] %.*s\n", rescode, (int)(len - 4), &rbuf.data[8]);
     buf_free(&rbuf);
     return 0;
 }
@@ -171,10 +194,7 @@ static int32_t read_res(int fd) {
 // -------------------------------------------------------------------------------------
 // MAIN --------------------------------------------------------------------------------
 
-int main(int argc, char *argv[]) {
-    (void)argc;
-    (void)argv;
-
+int main(int argc, char **argv) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         die("socket()");
@@ -189,35 +209,17 @@ int main(int argc, char *argv[]) {
         die("connect");
     }
 
-    // multiple pipelined requests
-    char *big_msg = (char *)malloc(k_max_msg);
-    memset(big_msg, 'z', k_max_msg);
-
-    const char *query_list[5];
-    size_t query_len[5];
-    query_list[0] = "hello1";      query_len[0] = strlen("hello1");
-    query_list[1] = "hello2";      query_len[1] = strlen("hello2");
-    query_list[2] = "hello3";      query_len[2] = strlen("hello3");
-    // a large message requires multiple event loop iterations
-    query_list[3] = big_msg;       query_len[3] = k_max_msg;
-    query_list[4] = "hello5";      query_len[4] = strlen("hello5");
-    size_t query_count = 5;
-
-    for (size_t i = 0; i < query_count; ++i) {
-        int32_t err = send_req(fd, (const uint8_t *)query_list[i], query_len[i]);
-        if (err) {
-            goto L_DONE;
-        }
+    // the command is just the program's argv[1:], e.g. `./client get k`
+    int32_t err = send_req(fd, argv + 1, (size_t)(argc - 1));
+    if (err) {
+        goto L_DONE;
     }
-    for (size_t i = 0; i < query_count; ++i) {
-        int32_t err = read_res(fd);
-        if (err) {
-            goto L_DONE;
-        }
+    err = read_res(fd);
+    if (err) {
+        goto L_DONE;
     }
 
 L_DONE:
-    free(big_msg);
     close(fd);
     return 0;
 }

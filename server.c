@@ -19,6 +19,7 @@
 #define BACKLOG 10
 // #define k_max_msg 4096
 const size_t k_max_msg = 32 << 20;
+const size_t k_max_args = 200 * 1000;
 
 // -------------------------------------------------------------------------------------
 // HELPERS -----------------------------------------------------------------------------
@@ -87,6 +88,17 @@ static size_t buf_cap(const Buffer *buf) {
     return (size_t)(buf->buffer_end - buf->buffer_begin);
 }
 
+// remove from the front: just advance a pointer, no data movement
+static void buf_consume(Buffer *buf, size_t n) {
+    assert(n <= buf_len(buf));
+    buf->data_begin += n;
+    if (buf->data_begin == buf->data_end) {
+        // fully drained: reset to the start so future appends get max space
+        buf->data_begin = buf->buffer_begin;
+        buf->data_end = buf->buffer_begin;
+    }
+}
+
 // append to the back
 static void buf_append(Buffer *buf, const uint8_t *data, size_t len) {
     size_t used = buf_len(buf);
@@ -118,17 +130,6 @@ static void buf_append(Buffer *buf, const uint8_t *data, size_t len) {
 
     memcpy(buf->data_end, data, len);
     buf->data_end += len;
-}
-
-// remove from the front: just advance a pointer, no data movement
-static void buf_consume(Buffer *buf, size_t n) {
-    assert(n <= buf_len(buf));
-    buf->data_begin += n;
-    if (buf->data_begin == buf->data_end) {
-        // fully drained: reset to the start so future appends get max space
-        buf->data_begin = buf->buffer_begin;
-        buf->data_end = buf->buffer_begin;
-    }
 }
 
 // -------------------------------------------------------------------------------------
@@ -174,6 +175,209 @@ static Conn *handle_accept(int fd) {
     return conn;
 }
 
+// -------------------------------------------------------------------------------------
+// STR ---------------------------------------------------------------------------------
+
+// a non-owning view into someone else's bytes (replaces std::string in cmd parsing)
+typedef struct Str {
+    const uint8_t *data;
+    size_t len;
+} Str;
+
+// growable array of Str, replaces std::vector<std::string> cmd
+typedef struct StrList {
+    Str *items;
+    size_t len;
+    size_t cap;
+} StrList;
+
+static void strlist_init(StrList *list) {
+    list->items = NULL;
+    list->len = 0;
+    list->cap = 0;
+}
+
+static void strlist_push(StrList *list, Str s) {
+    if (list->len == list->cap) {
+        list->cap = list->cap ? list->cap * 2 : 8;
+        list->items = (Str *)realloc(list->items, list->cap * sizeof(Str));
+        if (!list->items) {
+            die("realloc error");
+        }
+    }
+    list->items[list->len++] = s;
+}
+
+static void strlist_free(StrList *list) {
+    free(list->items);
+    list->items = NULL;
+    list->len = 0;
+    list->cap = 0;
+}
+
+static bool str_eq(const Str *s, const char *lit) {
+    size_t lit_len = strlen(lit);
+    return s->len == lit_len && memcmp(s->data, lit, lit_len) == 0;
+}
+
+// -------------------------------------------------------------------------------------
+// parsing helpers (equivalent of read_u32/read_str/parse_req)
+// -------------------------------------------------------------------------------------
+
+static bool read_u32(const uint8_t **cur, const uint8_t *end, uint32_t *out) {
+    if (*cur + 4 > end) {
+        return false;
+    }
+    memcpy(out, *cur, 4);
+    *cur += 4;
+    return true;
+}
+
+static bool read_str(const uint8_t **cur, const uint8_t *end, size_t n, Str *out) {
+    if (*cur + n > end) {
+        return false;
+    }
+    out->data = *cur;   // no copy: points into the caller's buffer
+    out->len = n;
+    *cur += n;
+    return true;
+}
+
+// +------+-----+------+-----+------+-----+-----+------+
+// | nstr | len | str1 | len | str2 | ... | len | strn |
+// +------+-----+------+-----+------+-----+-----+------+
+static int32_t parse_req(const uint8_t *data, size_t size, StrList *out) {
+    const uint8_t *end = data + size;
+    uint32_t nstr = 0;
+    if (!read_u32(&data, end, &nstr)) {
+        return -1;
+    }
+    if (nstr > k_max_args) {
+        return -1;  // safety limit
+    }
+
+    while (out->len < nstr) {
+        uint32_t len = 0;
+        if (!read_u32(&data, end, &len)) {
+            return -1;
+        }
+        Str s;
+        if (!read_str(&data, end, len, &s)) {
+            return -1;
+        }
+        strlist_push(out, s);
+    }
+    if (data != end) {
+        return -1;  // trailing garbage
+    }
+    return 0;
+}
+
+// -------------------------------------------------------------------------------------
+// RESPONSE ----------------------------------------------------------------------------
+
+// Response::status
+enum {
+    RES_OK = 0,
+    RES_ERR = 1,    // error
+    RES_NX = 2,     // key not found
+};
+
+// +--------+---------+
+// | status | data... |
+// +--------+---------+
+typedef struct Response {
+    uint32_t status;
+    uint8_t *data;      // owned, malloc'd; NULL if empty
+    size_t data_len;
+} Response;
+
+// placeholder; implemented later with a real hashtable
+typedef struct {
+    uint8_t *key;
+    size_t key_len;
+    uint8_t *val;
+    size_t val_len;
+} KVPair;
+
+static KVPair *g_data = NULL;
+static size_t g_data_len = 0;
+static size_t g_data_cap = 0;
+
+static ssize_t g_data_find(const Str *key) {
+    for (size_t i = 0; i < g_data_len; i++) {
+        if (g_data[i].key_len == key->len &&
+            memcmp(g_data[i].key, key->data, key->len) == 0) {
+            return (ssize_t)i;
+        }
+    }
+    return -1;
+}
+
+static void g_data_set(const Str *key, const Str *val) {
+    ssize_t idx = g_data_find(key);
+    if (idx >= 0) {
+        free(g_data[idx].val);
+        g_data[idx].val = (uint8_t *)malloc(val->len);
+        memcpy(g_data[idx].val, val->data, val->len);
+        g_data[idx].val_len = val->len;
+        return;
+    }
+    if (g_data_len == g_data_cap) {
+        g_data_cap = g_data_cap ? g_data_cap * 2 : 16;
+        g_data = (KVPair *)realloc(g_data, g_data_cap * sizeof(KVPair));
+        if (!g_data) {
+            die("realloc error");
+        }
+    }
+    KVPair *kv = &g_data[g_data_len++];
+    kv->key = (uint8_t *)malloc(key->len);
+    memcpy(kv->key, key->data, key->len);
+    kv->key_len = key->len;
+    kv->val = (uint8_t *)malloc(val->len);
+    memcpy(kv->val, val->data, val->len);
+    kv->val_len = val->len;
+}
+
+static void g_data_del(const Str *key) {
+    ssize_t idx = g_data_find(key);
+    if (idx < 0) {
+        return;
+    }
+    free(g_data[idx].key);
+    free(g_data[idx].val);
+    g_data[idx] = g_data[g_data_len - 1];  // swap-remove, O(1)
+    g_data_len--;
+}
+
+static void do_request(const StrList *cmd, Response *out) {
+    if (cmd->len == 2 && str_eq(&cmd->items[0], "get")) {
+        ssize_t idx = g_data_find(&cmd->items[1]);
+        if (idx < 0) {
+            out->status = RES_NX;   // not found
+            return;
+        }
+        out->data = (uint8_t *)malloc(g_data[idx].val_len);
+        memcpy(out->data, g_data[idx].val, g_data[idx].val_len);
+        out->data_len = g_data[idx].val_len;
+    } else if (cmd->len == 3 && str_eq(&cmd->items[0], "set")) {
+        g_data_set(&cmd->items[1], &cmd->items[2]);
+    } else if (cmd->len == 2 && str_eq(&cmd->items[0], "del")) {
+        g_data_del(&cmd->items[1]);
+    } else {
+        out->status = RES_ERR;      // unrecognized command
+    }
+}
+
+static void make_response(const Response *resp, Buffer *out) {
+    uint32_t resp_len = 4 + (uint32_t)resp->data_len;
+    buf_append(out, (const uint8_t *)&resp_len, 4);
+    buf_append(out, (const uint8_t *)&resp->status, 4);
+    if (resp->data_len > 0) {
+        buf_append(out, resp->data, resp->data_len);
+    }
+}
+
 // process 1 request if there is enough data
 static bool try_one_request(Conn *conn) {
     // try to parse the protocol: message header
@@ -194,12 +398,19 @@ static bool try_one_request(Conn *conn) {
     const uint8_t *request = &conn->incoming.data_begin[4];
 
     // got one request, do some application logic
-    printf("client says: len:%d data:%.*s\n",
-        len, len < 100 ? len : 100, request);
-
-    // generate the response (echo)
-    buf_append(&conn->outgoing, (const uint8_t *)&len, 4);
-    buf_append(&conn->outgoing, request, len);
+    StrList cmd;
+    strlist_init(&cmd);
+    if (parse_req(request, len, &cmd) < 0) {
+        msg("bad request");
+        conn->want_close = true;
+        strlist_free(&cmd);
+        return false;   // want close
+    }
+    Response resp = {0};
+    do_request(&cmd, &resp);
+    make_response(&resp, &conn->outgoing);
+    free(resp.data);
+    strlist_free(&cmd);
 
     // application logic done! remove the request message.
     buf_consume(&conn->incoming, 4 + len);
