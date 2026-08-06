@@ -10,9 +10,13 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <unistd.h>
+#include <sys/types.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/ip.h>
+#include <stddef.h>     // offsetof
+// proj
+#include "hashtable.h"
 
 
 #define PORT 3490
@@ -23,6 +27,9 @@ const size_t k_max_args = 200 * 1000;
 
 // -------------------------------------------------------------------------------------
 // HELPERS -----------------------------------------------------------------------------
+
+#define container_of(ptr, T, member) \
+    ((T *)((char *)(ptr) - offsetof(T, member)))
 
 static void msg(const char *msg) {
     fprintf(stderr, "%s\n", msg);
@@ -57,7 +64,13 @@ static void fd_set_nb(int fd) {
 // -------------------------------------------------------------------------------------
 // VECTOR ------------------------------------------------------------------------------
 
-// a growable byte buffer, replaces std::vector<uint8_t>
+// a (growable) byte buffer with separate read/write cursors, replaces std::vector<uint8_t>
+//
+//   ┌────────────┬────────────┬────────────┐
+//   │   unused   │    data    │   unused   │
+//   └────────────┴────────────┴────────────┘
+//   ⇧            ⇧            ⇧            ⇧
+// buffer_begin data_begin  data_end   buffer_end
 typedef struct {
     uint8_t *buffer_begin;
     uint8_t *buffer_end;
@@ -292,78 +305,117 @@ typedef struct Response {
     size_t data_len;
 } Response;
 
-// placeholder; implemented later with a real hashtable
-typedef struct {
+// // placeholder; implemented later with a real hashtable
+// typedef struct KVPair {
+//     uint8_t *key;
+//     size_t key_len;
+//     uint8_t *val;
+//     size_t val_len;
+// } KVPair;
+
+// static KVPair *g_data = NULL;
+// static size_t g_data_len = 0;
+// static size_t g_data_cap = 0;
+
+// the structure for the key, intrusive: HNode is embedded, not pointed to
+typedef struct Entry {
+    HNode node;
     uint8_t *key;
     size_t key_len;
     uint8_t *val;
     size_t val_len;
-} KVPair;
+} Entry;
 
-static KVPair *g_data = NULL;
-static size_t g_data_len = 0;
-static size_t g_data_cap = 0;
+// the data structure for the key space
+static struct {
+    HMap db;
+} g_data;
 
-static ssize_t g_data_find(const Str *key) {
-    for (size_t i = 0; i < g_data_len; i++) {
-        if (g_data[i].key_len == key->len &&
-            memcmp(g_data[i].key, key->data, key->len) == 0) {
-            return (ssize_t)i;
-        }
+// FNV-1a-style hash
+static uint64_t str_hash(const uint8_t *data, size_t len) {
+    uint32_t h = 0x811C9DC5;
+    for (size_t i = 0; i < len; i++) {
+        h = (h + data[i]) * 0x01000193;
     }
-    return -1;
+    return h;
 }
 
-static void g_data_set(const Str *key, const Str *val) {
-    ssize_t idx = g_data_find(key);
-    if (idx >= 0) {
-        free(g_data[idx].val);
-        g_data[idx].val = (uint8_t *)malloc(val->len);
-        memcpy(g_data[idx].val, val->data, val->len);
-        g_data[idx].val_len = val->len;
-        return;
-    }
-    if (g_data_len == g_data_cap) {
-        g_data_cap = g_data_cap ? g_data_cap * 2 : 16;
-        g_data = (KVPair *)realloc(g_data, g_data_cap * sizeof(KVPair));
-        if (!g_data) {
-            die("realloc error");
-        }
-    }
-    KVPair *kv = &g_data[g_data_len++];
-    kv->key = (uint8_t *)malloc(key->len);
-    memcpy(kv->key, key->data, key->len);
-    kv->key_len = key->len;
-    kv->val = (uint8_t *)malloc(val->len);
-    memcpy(kv->val, val->data, val->len);
-    kv->val_len = val->len;
+static bool entry_eq(HNode *lhs, HNode *rhs) {
+    Entry *le = container_of(lhs, Entry, node);
+    Entry *re = container_of(rhs, Entry, node);
+    return le->key_len == re->key_len &&
+            memcmp(le->key, re->key, le->key_len) == 0;
 }
 
-static void g_data_del(const Str *key) {
-    ssize_t idx = g_data_find(key);
-    if (idx < 0) {
+static void do_get(const Str *key, Response *out) {
+    // a throwaway, non-owning Entry just to drive the lookup
+    Entry key_entry = {0};
+    key_entry.key = (uint8_t *)key->data;
+    key_entry.key_len = key->len;
+    key_entry.node.hcode = str_hash(key->data, key->len);
+
+    HNode *node = hm_lookup(&g_data.db, &key_entry.node, &entry_eq);
+    if (!node) {
+        out->status = RES_NX;   // not found
         return;
     }
-    free(g_data[idx].key);
-    free(g_data[idx].val);
-    g_data[idx] = g_data[g_data_len - 1];  // swap-remove, O(1)
-    g_data_len--;
+    Entry *ent = container_of(node, Entry, node);
+    out->data = (uint8_t *)malloc(ent->val_len);
+    memcpy(out->data, ent->val, ent->val_len);
+    out->data_len = ent->val_len;
+}
+
+static void do_set(const Str *key, const Str *val) {
+    Entry key_entry = {0};
+    key_entry.key = (uint8_t *)key->data;
+    key_entry.key_len = key->len;
+    key_entry.node.hcode = str_hash(key->data, key->len);
+
+    HNode *node = hm_lookup(&g_data.db, &key_entry.node, &entry_eq);
+    if (node) {
+        // update the existing value
+        Entry *ent = container_of(node, Entry, node);
+        free(ent->val);
+        ent->val = (uint8_t *)malloc(val->len);
+        memcpy(ent->val, val->data, val->len);
+        ent->val_len = val->len;
+        return;
+    }
+    // insert a new entry; the hashtable owns it from here on
+    Entry *ent = (Entry *)malloc(sizeof(Entry));
+    ent->node.next = NULL;
+    ent->node.hcode = key_entry.node.hcode;
+    ent->key = (uint8_t *)malloc(key->len);
+    memcpy(ent->key, key->data, key->len);
+    ent->key_len = key->len;
+    ent->val = (uint8_t *)malloc(val->len);
+    memcpy(ent->val, val->data, val->len);
+    ent->val_len = val->len;
+    hm_insert(&g_data.db, &ent->node);
+}
+
+static void do_del(const Str *key) {
+    Entry key_entry = {0};
+    key_entry.key = (uint8_t *)key->data;
+    key_entry.key_len = key->len;
+    key_entry.node.hcode = str_hash(key->data, key->len);
+
+    HNode *node = hm_delete(&g_data.db, &key_entry.node, &entry_eq);
+    if (node) {
+        Entry *ent = container_of(node, Entry, node);
+        free(ent->key);
+        free(ent->val);
+        free(ent);
+    }
 }
 
 static void do_request(const StrList *cmd, Response *out) {
     if (cmd->len == 2 && str_eq(&cmd->items[0], "get")) {
-        ssize_t idx = g_data_find(&cmd->items[1]);
-        if (idx < 0) {
-            out->status = RES_NX;   // not found
-            return;
-        }
-        out->data = (uint8_t *)malloc(g_data[idx].val_len);
-        memcpy(out->data, g_data[idx].val, g_data[idx].val_len);
-        out->data_len = g_data[idx].val_len;
+        do_get(&cmd->items[1], out);
     } else if (cmd->len == 3 && str_eq(&cmd->items[0], "set")) {
-        g_data_set(&cmd->items[1], &cmd->items[2]);
+        do_set(&cmd->items[1], &cmd->items[2]);
     } else if (cmd->len == 2 && str_eq(&cmd->items[0], "del")) {
-        g_data_del(&cmd->items[1]);
+        do_del(&cmd->items[1]);
     } else {
         out->status = RES_ERR;      // unrecognized command
     }
