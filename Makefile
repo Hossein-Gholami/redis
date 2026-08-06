@@ -25,4 +25,7 @@ $(BIN_DIR):
 clean:
 	rm -rf $(BIN_DIR)
 
-.PHONY: all clean
+compile:
+	gcc -std=c11 -Wall -Wextra hashtable.c server.c -o bin/server.o
+
+.PHONY: all clean compile

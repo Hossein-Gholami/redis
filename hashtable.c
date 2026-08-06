@@ -77,6 +77,7 @@ static void hm_trigger_rehashing(HMap *hmap) {
 }
 
 HNode *hm_lookup(HMap *hmap, HNode *key, bool (*eq)(HNode *, HNode *)) {
+    hm_help_rehashing(hmap);
     HNode **from = h_lookup(&hmap->newer, key, eq);
     if (!from) {
         from = h_lookup(&hmap->older, key, eq);
@@ -102,6 +103,7 @@ void hm_insert(HMap *hmap, HNode *node) {
 }
 
 HNode *hm_delete(HMap *hmap, HNode *key, bool (*eq)(HNode *, HNode *)) {
+    hm_help_rehashing(hmap);
     HNode **from = h_lookup(&hmap->newer, key, eq);
     if (from) {
         return h_detach(&hmap->newer, from);
